@@ -2,7 +2,25 @@
 
 ## Overview
 
-Built a custom async evaluator to replace OpenCompass's slow evaluation stage, achieving 2+ rps throughput vs OC's ~0.21 rps. The pipeline runs OC inference, then uses async judge calls for evaluation.
+Built a custom async evaluator to replace OpenCompass's slow evaluation stage, achieving 2+ rps throughput vs OC's ~0.21 rps. The pipeline runs OC inference, then uses async judge calls for evaluation. The current default judge model is **gpt-oss-120b**.
+
+## Quickstart (do this from `/root/nathan/opencompass`)
+
+1) Download data: grab the HealthBench JSONL files from `https://huggingface.co/datasets/opencompass/healthbench` and place them at `data/healthbench/` (`2025-05-07-06-14-12_oss_eval.jsonl`, `hard_2025-05-08-21-00-10.jsonl`, `consensus_2025-05-09-20-00-46.jsonl`).
+2) Judge model: export your judge API; defaults to `qwen3-235b-a22b-thinking-2507`:
+   ```bash
+   export OC_JUDGE_API_BASE="http://YOUR_API_BASE/v1"
+   export OC_JUDGE_API_KEY=YOUR_KEY
+   export OC_JUDGE_MODEL="qwen3-235b-a22b-thinking-2507"
+   ```
+3) Inference model: set/adjust `models` in `healthbench_infer_config.py` (or import a model config).
+4) Run the full pipeline (inference → async eval):
+   ```bash
+   ./run_healthbench_full.sh <inference_model_name> <dev_subset> <concurrency>
+   # e.g.
+   ./run_healthbench_full.sh gpt-oss-120b full 200
+   ```
+Outputs land under `outputs/<work_dir>/results/` (per-subset JSON) and `judge_logs/`.
 
 ## Files Created
 
@@ -172,7 +190,7 @@ OC inference (run.py)  →  predictions/*.json  →  async_healthbench_eval.py  
 
 ## Usage Examples
 
-### Test async evaluator only:
+### Test async evaluator only (run from repo root `/root/nathan/opencompass`):
 ```bash
 python async_healthbench_eval.py \
   --predictions outputs/.../predictions/MODEL/ \
@@ -185,7 +203,7 @@ python async_healthbench_eval.py \
   --judge-log test_judge.jsonl
 ```
 
-### Full pipeline:
+### Full pipeline (run from repo root `/root/nathan/opencompass`):
 ```bash
 ./run_healthbench_full.sh qwen3-4b-thinking-2507 dev_50 200
 ```
@@ -199,6 +217,12 @@ python async_healthbench_eval.py \
   --judge-log existing_judge_log.jsonl \
   --output results.json
 ```
+
+## Data Download and Layout
+
+- Download HealthBench JSONL data from the official release: `https://huggingface.co/datasets/opencompass/healthbench` (contains `2025-05-07-06-14-12_oss_eval.jsonl`, `hard_2025-05-08-21-00-10.jsonl`, `consensus_2025-05-09-20-00-46.jsonl`).
+- Save the JSONL files to `data/healthbench/` inside the repo. The async evaluator defaults to these paths when `--dataset-subset` is provided.
+- Ensure you run commands from the repo root `/root/nathan/opencompass` so relative paths resolve.
 
 ## Output Format
 
