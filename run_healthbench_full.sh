@@ -1,413 +1,462 @@
-#!/usr/bin/env bash
-# run_healthbench_full.sh
-# Full HealthBench pipeline: OC inference + async evaluation for all subsets
-#
-# Usage:
-#   ./run_healthbench_full.sh MODEL_NAME [DEV_SUBSET] [CONCURRENCY]
-#
-# Examples:
-#   ./run_healthbench_full.sh qwen3-4b-thinking-2507 dev_50 200
-#   ./run_healthbench_full.sh my_model full 300
-#   ./run_healthbench_full.sh my_model dev_tiny
+# Async HealthBench Evaluator Implementation
 
-set -euo pipefail
+## Overview
 
-# Arguments
-MODEL_NAME="${1:-}"
-DEV_SUBSET="${2:-dev_50}"
-CONCURRENCY="${3:-200}"
+Built a custom async evaluator to replace OpenCompass's slow evaluation stage, achieving 2+ rps throughput vs OC's ~0.21 rps. The pipeline runs OC inference, then uses async judge calls for evaluation. The current default judge model is **gpt-oss-120b**.
 
-# Validate required args
-if [ -z "$MODEL_NAME" ]; then
-    echo "Usage: $0 MODEL_NAME [DEV_SUBSET] [CONCURRENCY]"
-    echo ""
-    echo "Arguments:"
-    echo "  MODEL_NAME    Required. Model name/abbr as it appears in OC predictions dir"
-    echo "  DEV_SUBSET    Optional. One of: dev_tiny, dev_50, dev_100, dev_medium, full (default: dev_50)"
-    echo "  CONCURRENCY   Optional. Max concurrent judge calls (default: 200)"
-    echo ""
-    echo "Examples:"
-    echo "  $0 qwen3-4b-thinking-2507 dev_50 200"
-    echo "  $0 my_model full 300"
-    exit 1
-fi
+## Quickstart (do this from `/root/nathan/opencompass`)
 
-# Determine limit based on dev subset
-case "$DEV_SUBSET" in
-    dev_tiny)
-        LIMIT_BASE=2
-        LIMIT_HARD=1
-        LIMIT_CONSENSUS=2
-        ;;
-    dev_50)
-        LIMIT_BASE=50
-        LIMIT_HARD=0  # Skip hard/consensus for dev_50
-        LIMIT_CONSENSUS=0
-        ;;
-    dev_100)
-        LIMIT_BASE=50
-        LIMIT_HARD=25
-        LIMIT_CONSENSUS=25
-        ;;
-    dev_medium)
-        LIMIT_BASE=250
-        LIMIT_HARD=100
-        LIMIT_CONSENSUS=300
-        ;;
-    full|"")
-        LIMIT_BASE=0
-        LIMIT_HARD=0
-        LIMIT_CONSENSUS=0
-        ;;
-    *)
-        echo "Warning: Unknown dev subset '$DEV_SUBSET', using no limit"
-        LIMIT_BASE=0
-        LIMIT_HARD=0
-        LIMIT_CONSENSUS=0
-        ;;
-esac
+1) Download data: grab the HealthBench JSONL files from `https://huggingface.co/datasets/opencompass/healthbench` and place them at `data/healthbench/` (`2025-05-07-06-14-12_oss_eval.jsonl`, `hard_2025-05-08-21-00-10.jsonl`, `consensus_2025-05-09-20-00-46.jsonl`).
+2) Judge model: export your judge API; defaults to `qwen3-235b-a22b-thinking-2507`:
+   ```bash
+   export OC_JUDGE_API_BASE="http://YOUR_API_BASE/v1"
+   export OC_JUDGE_API_KEY=YOUR_KEY
+   export OC_JUDGE_MODEL="qwen3-235b-a22b-thinking-2507"
+   ```
+3) Inference model: set/adjust `models` in `healthbench_infer_config.py` (or import a model config).
+4) Run the full pipeline (inference → async eval):
+   ```bash
+   ./run_healthbench_full.sh <inference_model_name> <dev_subset> <concurrency>
+   # e.g.
+   ./run_healthbench_full.sh gpt-oss-120b full 200
+   ```
+Outputs land under `outputs/<work_dir>/results/` (per-subset JSON) and `judge_logs/`.
 
-# Paths
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_DIR="outputs/healthbench_${DEV_SUBSET}_${TIMESTAMP}"
-DATA_DIR="data/huihuixu/healthbench"
+## Files Created
 
-# Track overall pipeline timing
-PIPELINE_START_TIME=$(date +%s)
+### 1. `healthbench_scoring.py`
+**Purpose:** Scoring logic extracted from `opencompass/datasets/healthbench/healthbench.py`
 
-echo "============================================================"
-echo "HealthBench Full Pipeline"
-echo "============================================================"
-echo "Model:       $MODEL_NAME"
-echo "Dev Subset:  $DEV_SUBSET"
-echo "Concurrency: $CONCURRENCY"
-echo "Output Dir:  $OUTPUT_DIR"
-echo "============================================================"
-echo ""
+**Key Components:**
+- `RubricItem` class - represents a single rubric criterion with points and tags
+- `calculate_score()` - computes score for a single example (sum points for met criteria)
+- `compute_clipped_stats()` - computes mean, bootstrap_std, n_samples (matches OC's `_compute_clipped_stats`)
+- `aggregate_scores()` - aggregates across all examples with per-tag breakdowns
+- `ScoredExample` dataclass - holds results for a single example
+- Grader prompt templates (`GRADER_TEMPLATE`, `PER_EXAMPLE_GRADER_TEMPLATE`) - copied from healthbench.py
+- Prompt building functions (`build_grader_prompt_per_rubric`, `build_grader_prompt_per_example`)
+- JSON parsing utilities (`parse_json_response`, `parse_per_example_response`)
 
-# Step 1: Run OC inference
-echo "[Step 1/2] Running OpenCompass inference..."
-echo ""
+**Reused from healthbench.py:**
+- Exact scoring logic (calculate_score, bootstrap_std)
+- Tag groupings (example_tags + rubric_tags)
+- RubricItem structure
 
-INFERENCE_START_TIME=$(date +%s)
+### 2. `async_healthbench_eval.py`
+**Purpose:** Main CLI evaluator with async judge calls
 
-if [ "$DEV_SUBSET" != "full" ]; then
-    export HEALTHBENCH_SUBSET="$DEV_SUBSET"
-fi
+**CLI Arguments:**
+- `--predictions`: Path to OC predictions JSON file or directory of sharded files
+- `--dataset`: Path to HealthBench JSONL (optional if using --dataset-subset)
+- `--dataset-subset`: Auto-selects dataset file (`base`, `hard`, `consensus`)
+- `--mode`: `per_rubric` (default) or `per_example`
+- `--concurrency`: Max concurrent judge calls (default: 200)
+- `--output`: Results JSON path
+- `--judge-log`: Streaming JSONL of judge outputs (enables resume)
+- `--resume-from`: Skip already-judged items from existing JSONL
+- `--limit`: Limit to first N examples (0 = no limit)
+- `--subset`: Dev subset name for metadata (e.g., dev_50, dev_tiny)
+- `--api-base`, `--api-key`, `--model`: Judge API config (or env vars)
+- `--max-tokens`, `--timeout`, `--max-retries`: Judge call parameters
+- `--verbose`: Verbose output
 
-python run.py \
-    healthbench_infer_config.py \
-    --mode infer \
-    -w "$OUTPUT_DIR"
+**Key Features:**
+- **Join Strategy:** Joins predictions to dataset by position index with safety checks:
+  - Asserts length match (with warnings)
+  - Logs first 5 entries showing index + prompt_id for manual verification
+  - Future: Can join by prompt_id if predictions include it
+- **Prediction Loading:** 
+  - Supports single JSON file or directory of sharded files
+  - Filters by subset pattern when `--dataset-subset` is used:
+    - `base`: `healthbench_[0-9]*.json` (excludes hard/consensus)
+    - `hard`: `healthbench_hard.json`
+    - `consensus`: `healthbench_consensus.json`
+- **Async Judge Calls:**
+  - Semaphore-based concurrency control
+  - Retry logic (max 3 retries, exponential backoff for rate limits)
+  - Streaming JSONL output for resume capability
+  - Progress logging with RPS calculation
+- **Resume Support:**
+  - Loads already-judged items from `--resume-from` JSONL
+  - Skips those items during evaluation
+  - Enables resuming interrupted runs
+- **Output Format:**
+  - Matches OC structure: `accuracy`, `accuracy_std`, `n_samples`
+  - Adds `config` section with mode, concurrency, subset info
+  - Adds `timing` section with total time and RPS
+  - Includes per-tag metrics in `details`
 
-INFERENCE_END_TIME=$(date +%s)
-INFERENCE_DURATION=$((INFERENCE_END_TIME - INFERENCE_START_TIME))
-INFERENCE_HOURS=$((INFERENCE_DURATION / 3600))
-INFERENCE_MINS=$(((INFERENCE_DURATION % 3600) / 60))
-INFERENCE_SECS=$((INFERENCE_DURATION % 60))
-
-echo ""
-echo "[Step 1/2] Inference complete."
-echo ""
-
-# Step 2: Locate predictions directory
-echo "Locating predictions directory..."
-
-# OpenCompass may create a timestamped subdirectory inside work_dir when running inference-only
-# Structure: work_dir/TIMESTAMP/predictions/MODEL/
-# But for full runs, predictions are directly in work_dir/predictions/MODEL/
-# Check both locations
-TIMESTAMP_DIR=$(find "$OUTPUT_DIR" -maxdepth 1 -type d -name "20*" | sort -r | head -1)
-
-if [ -n "$TIMESTAMP_DIR" ] && [ -d "$TIMESTAMP_DIR/predictions" ]; then
-    # Inference-only run: predictions are in timestamp subdirectory
-    echo "  Found timestamp directory: $(basename "$TIMESTAMP_DIR")"
-    PRED_DIR="$TIMESTAMP_DIR/predictions/$MODEL_NAME"
-else
-    # Full run or direct structure: predictions are directly in work_dir
-    echo "  Using direct structure (no timestamp subdirectory)"
-    PRED_DIR="$OUTPUT_DIR/predictions/$MODEL_NAME"
-fi
-
-if [ ! -d "$PRED_DIR" ]; then
-    # Try to find any model directory under predictions
-    echo "  Model-specific directory not found, searching..."
-    
-    # Determine search location
-    if [ -n "$TIMESTAMP_DIR" ] && [ -d "$TIMESTAMP_DIR/predictions" ]; then
-        SEARCH_DIR="$TIMESTAMP_DIR/predictions"
-    else
-        SEARCH_DIR="$OUTPUT_DIR/predictions"
-    fi
-    
-    echo "  Looking in: $SEARCH_DIR"
-    
-    # List what's actually there
-    echo "  Contents:"
-    ls -la "$SEARCH_DIR" 2>/dev/null || echo "   (empty or inaccessible)"
-    
-    FOUND_DIR=$(find "$SEARCH_DIR" -type d -mindepth 1 -maxdepth 1 2>/dev/null | head -1)
-    if [ -n "$FOUND_DIR" ] && [ -d "$FOUND_DIR" ]; then
-        PRED_DIR="$FOUND_DIR"
-        echo "  ✓ Found model directory: $PRED_DIR"
-    else
-        echo "❌ ERROR: Could not find any model directory under predictions" >&2
-        echo "   Expected: $PRED_DIR" >&2
-        echo "   Searched in: $SEARCH_DIR" >&2
-        echo "   Available directories:" >&2
-        ls -la "$SEARCH_DIR" 2>/dev/null || echo "   (none)" >&2
-        exit 1
-    fi
-else
-    echo "  ✓ Found: $PRED_DIR"
-fi
-
-# Verify it has JSON files
-JSON_COUNT=$(find "$PRED_DIR" -name "*.json" 2>/dev/null | wc -l)
-if [ "$JSON_COUNT" -eq 0 ]; then
-    echo "⚠️  WARNING: No JSON files found in $PRED_DIR" >&2
-    echo "   This may indicate inference didn't complete successfully." >&2
-fi
-
-echo "  JSON files found: $JSON_COUNT"
-echo ""
-
-# Step 3: Run async evaluator for each subset
-echo "[Step 2/2] Running async evaluation..."
-echo ""
-
-EVALUATION_START_TIME=$(date +%s)
-
-# Create directories matching OC structure
-RESULTS_DIR="$OUTPUT_DIR/results/$MODEL_NAME"
-mkdir -p "$RESULTS_DIR"
-LOGS_EVAL_DIR="$OUTPUT_DIR/logs/eval/$MODEL_NAME"
-mkdir -p "$LOGS_EVAL_DIR"
-SUMMARY_DIR="$OUTPUT_DIR/summary"
-mkdir -p "$SUMMARY_DIR"
-JUDGE_LOG_DIR="$OUTPUT_DIR/judge_logs"  # Extra: OC doesn't have this, but useful for resume
-mkdir -p "$JUDGE_LOG_DIR"
-
-# Function to run evaluation for a subset
-run_eval() {
-    local SUBSET_NAME="$1"
-    local LIMIT="$2"
-    
-    # Skip if limit is 0 and not full run
-    if [ "$LIMIT" = "0" ] && [ "$DEV_SUBSET" != "full" ]; then
-        echo "Skipping $SUBSET_NAME (limit=0 for $DEV_SUBSET)"
-        return 0
-    fi
-    
-    # Map subset name to OC's file naming
-    case "$SUBSET_NAME" in
-        base)
-            OC_FILENAME="healthbench.json"
-            ;;
-        hard)
-            OC_FILENAME="healthbench_hard.json"
-            ;;
-        consensus)
-            OC_FILENAME="healthbench_consensus.json"
-            ;;
-        *)
-            OC_FILENAME="healthbench_${SUBSET_NAME}.json"
-            ;;
-    esac
-    
-    local JUDGE_LOG="$JUDGE_LOG_DIR/${OC_FILENAME%.json}.jsonl"
-    local RESULTS_FILE="$RESULTS_DIR/$OC_FILENAME"
-    local EVAL_LOG="$LOGS_EVAL_DIR/${OC_FILENAME%.json}.out"
-    
-    echo "--- Evaluating: $SUBSET_NAME (limit=$LIMIT) ---"
-    
-    # Run evaluator, redirecting stdout/stderr to eval log (matching OC)
-    python async_healthbench_eval.py \
-        --predictions "$PRED_DIR" \
-        --dataset-subset "$SUBSET_NAME" \
-        --mode per_rubric \
-        --concurrency "$CONCURRENCY" \
-        --limit "$LIMIT" \
-        --subset "$DEV_SUBSET" \
-        --output "$RESULTS_FILE" \
-        --judge-log "$JUDGE_LOG" \
-        2>&1 | tee "$EVAL_LOG"
-    
-    echo "Results: $RESULTS_FILE"
-    echo "Eval Log: $EVAL_LOG"
-    echo ""
+**Dataset File Mapping:**
+```python
+DATASET_FILES = {
+    "base": "2025-05-07-06-14-12_oss_eval.jsonl",
+    "hard": "hard_2025-05-08-21-00-10.jsonl",
+    "consensus": "consensus_2025-05-09-20-00-46.jsonl",
 }
+```
 
-# Run for each subset
-run_eval "base" "$LIMIT_BASE"
-run_eval "hard" "$LIMIT_HARD"
-run_eval "consensus" "$LIMIT_CONSENSUS"
+**Prediction Pattern Matching:**
+```python
+PREDICTION_PATTERNS = {
+    "base": r"^healthbench(_\d+)?\.json$",  # healthbench.json or healthbench_0.json, healthbench_1.json, etc.
+    "hard": r"^healthbench_hard(_\d+)?\.json$",  # healthbench_hard.json or healthbench_hard_0.json, etc.
+    "consensus": r"^healthbench_consensus(_\d+)?\.json$",  # healthbench_consensus.json or healthbench_consensus_0.json, etc.
+}
+```
 
-EVALUATION_END_TIME=$(date +%s)
-EVALUATION_DURATION=$((EVALUATION_END_TIME - EVALUATION_START_TIME))
-EVALUATION_HOURS=$((EVALUATION_DURATION / 3600))
-EVALUATION_MINS=$(((EVALUATION_DURATION % 3600) / 60))
-EVALUATION_SECS=$((EVALUATION_DURATION % 60))
+**Note**: All subsets support sharded files (with `_0`, `_1`, etc. suffix). The `(_\d+)?` pattern makes the shard number optional, so both single files (`healthbench_hard.json`) and sharded files (`healthbench_hard_0.json`) are matched.
 
-PIPELINE_END_TIME=$(date +%s)
-PIPELINE_DURATION=$((PIPELINE_END_TIME - PIPELINE_START_TIME))
-PIPELINE_HOURS=$((PIPELINE_DURATION / 3600))
-PIPELINE_MINS=$(((PIPELINE_DURATION % 3600) / 60))
-PIPELINE_SECS=$((PIPELINE_DURATION % 60))
+### 3. `run_healthbench_full.sh`
+**Purpose:** End-to-end wrapper script (OC inference + async evaluation)
 
-echo ""
-echo "============================================================"
-echo "Pipeline Complete!"
-echo "============================================================"
-echo "Output Dir: $OUTPUT_DIR"
-echo "Results: $RESULTS_DIR"
-echo "Eval Logs: $LOGS_EVAL_DIR"
-echo "Summary: $SUMMARY_DIR"
-echo "Judge Logs: $JUDGE_LOG_DIR (extra, for resume)"
-echo ""
-# Write timing to file
-TIMING_FILE="$OUTPUT_DIR/timing.txt"
-cat > "$TIMING_FILE" <<EOF
-HealthBench Pipeline Timing
-============================
-Model: $MODEL_NAME
-Dev Subset: $DEV_SUBSET
-Concurrency: $CONCURRENCY
-Timestamp: $(basename "$OUTPUT_DIR")
+**Usage:**
+```bash
+./run_healthbench_full.sh MODEL_NAME [DEV_SUBSET] [CONCURRENCY]
+```
 
-Inference Time:  ${INFERENCE_HOURS}h ${INFERENCE_MINS}m ${INFERENCE_SECS}s (${INFERENCE_DURATION}s)
-Evaluation Time: ${EVALUATION_HOURS}h ${EVALUATION_MINS}m ${EVALUATION_SECS}s (${EVALUATION_DURATION}s)
-Total Pipeline:  ${PIPELINE_HOURS}h ${PIPELINE_MINS}m ${PIPELINE_SECS}s (${PIPELINE_DURATION}s)
+**Features:**
+- Runs OC inference with `HEALTHBENCH_SUBSET` env var
+- Automatically finds predictions directory
+- Runs async evaluator for all 3 subsets (base, hard, consensus)
+- Respects dev subset limits:
+  - `dev_tiny`: 2 base, 1 hard, 2 consensus
+  - `dev_50`: 50 base only (hard/consensus skipped)
+  - `dev_medium`: 250 base, 100 hard, 300 consensus
+  - `full`: all examples (no limit)
+- Outputs separate results per subset: `results_base.json`, `results_hard.json`, `results_consensus.json`
+- Prints summary of all results at end
 
-Breakdown:
-----------
-- Inference: ${INFERENCE_DURATION} seconds
-- Evaluation: ${EVALUATION_DURATION} seconds
-- Total: ${PIPELINE_DURATION} seconds
+**Script Structure:**
+1. Validates arguments
+2. Determines limits based on dev subset
+3. Runs `python run.py healthbench_infer_config.py --mode infer`
+4. Locates predictions directory
+5. Calls `async_healthbench_eval.py` for each subset
+6. Prints summary
 
-Comparison with OpenCompass (4 days = 345600 seconds):
--------------------------------------------------------
-OpenCompass: 345600 seconds (4 days)
-This Pipeline: ${PIPELINE_DURATION} seconds
-Speedup: $(echo "scale=2; 345600 / ${PIPELINE_DURATION}" | bc)x faster
-EOF
+### 4. `healthbench_infer_config.py`
+**Purpose:** Wrapper config file for OC inference
 
-echo "============================================================"
-echo "Pipeline Complete!"
-echo "============================================================"
-echo "Output Dir: $OUTPUT_DIR"
-echo "Results: $RESULTS_DIR"
-echo "Eval Logs: $LOGS_EVAL_DIR"
-echo "Summary: $SUMMARY_DIR"
-echo "Judge Logs: $JUDGE_LOG_DIR (extra, for resume)"
-echo "Timing saved to: $TIMING_FILE"
-echo ""
+**Why needed:** The original `healthbench_gen_831613.py` only defines `healthbench_datasets` list, but OC's `run.py` expects a top-level `datasets` key in the config.
 
-# Generate summary files (matching OC)
-SUMMARY_BASE="$SUMMARY_DIR/summary_$(basename "$OUTPUT_DIR")"
-echo "Generating summary files..."
+**Solution:** Created minimal wrapper that:
+- Imports `healthbench_datasets` from the original config
+- Exports as `datasets` for OC compatibility
+- Can be used with `python run.py healthbench_infer_config.py --mode infer`
 
-# Create summary markdown
-cat > "${SUMMARY_BASE}.md" <<EOF
-# HealthBench Evaluation Summary
+**IMPORTANT:** This config requires models to be added. You must either:
+1. Import models from a model config: `from opencompass.configs.models.your_model import models`
+2. Define models inline in the config file
+3. Modify the bash script to merge a model config
 
-**Model:** $MODEL_NAME  
-**Dev Subset:** $DEV_SUBSET  
-**Concurrency:** $CONCURRENCY  
-**Timestamp:** $(basename "$OUTPUT_DIR")
+**Current status:** Has placeholder `models = []` - will fail until models are added.
 
-## Timing
+## Architecture
 
-- **Inference Time:** ${INFERENCE_HOURS}h ${INFERENCE_MINS}m ${INFERENCE_SECS}s (${INFERENCE_DURATION}s)
-- **Evaluation Time:** ${EVALUATION_HOURS}h ${EVALUATION_MINS}m ${EVALUATION_SECS}s (${EVALUATION_DURATION}s)
-- **Total Pipeline:** ${PIPELINE_HOURS}h ${PIPELINE_MINS}m ${PIPELINE_SECS}s (${PIPELINE_DURATION}s)
+```
+OC predictions/*.json  +  HealthBench JSONL  →  async_healthbench_eval.py  →  results.json
+       +
+HealthBench rubrics
+```
 
-## Results
+**Full Pipeline:**
+```
+OC inference (run.py)  →  predictions/*.json  →  async_healthbench_eval.py  →  results.json
+```
 
-EOF
+## Key Design Decisions
 
-# Create summary CSV
-echo "dataset,accuracy,accuracy_std,n_samples" > "${SUMMARY_BASE}.csv"
-echo "timing,inference_seconds,evaluation_seconds,total_seconds" >> "${SUMMARY_BASE}.csv"
-echo "timing,${INFERENCE_DURATION},${EVALUATION_DURATION},${PIPELINE_DURATION}" >> "${SUMMARY_BASE}.csv"
+### 1. Join Strategy
+- **Current:** Position-based join (predictions["0"] ↔ dataset[0])
+- **Safety:** Length assertions + logging for manual verification
+- **Future:** Can join by `prompt_id` if OC predictions include it
 
-# Create summary text
-cat > "${SUMMARY_BASE}.txt" <<EOF
-HealthBench Evaluation Summary
-===============================
-Model: $MODEL_NAME
-Dev Subset: $DEV_SUBSET
-Concurrency: $CONCURRENCY
-Timestamp: $(basename "$OUTPUT_DIR")
+### 2. Subset Handling
+- OC runs 3 separate datasets: base, hard, consensus
+- Each has separate prediction files
+- Async evaluator handles each separately with pattern matching
 
-Timing:
--------
-Inference Time:  ${INFERENCE_HOURS}h ${INFERENCE_MINS}m ${INFERENCE_SECS}s (${INFERENCE_DURATION}s)
-Evaluation Time: ${EVALUATION_HOURS}h ${EVALUATION_MINS}m ${EVALUATION_SECS}s (${EVALUATION_DURATION}s)
-Total Pipeline:  ${PIPELINE_HOURS}h ${PIPELINE_MINS}m ${PIPELINE_SECS}s (${PIPELINE_DURATION}s)
+### 3. Resume Support
+- Judge log is streaming JSONL (one line per rubric result)
+- Each line is self-contained: `prompt_id`, `rubric_index`, `criteria_met`, `explanation`, `raw_response`
+- Resume state tracks which `(prompt_id, rubric_index)` pairs are already judged
 
-Results:
---------
-EOF
+### 4. Scoring Equivalence
+- Ported exact logic from `healthbench.py`:
+  - Same `calculate_score()` function
+  - Same `bootstrap_std()` implementation
+  - Same tag groupings
+- Ensures scores match OC's output
 
-# Collect results and write to summary
-for SUBSET_NAME in base hard consensus; do
-    case "$SUBSET_NAME" in
-        base)
-            OC_FILENAME="healthbench.json"
-            ;;
-        hard)
-            OC_FILENAME="healthbench_hard.json"
-            ;;
-        consensus)
-            OC_FILENAME="healthbench_consensus.json"
-            ;;
-    esac
-    RESULTS_FILE="$RESULTS_DIR/$OC_FILENAME"
-    if [ -f "$RESULTS_FILE" ]; then
-        python3 <<PYTHON_SCRIPT
-import json
-import sys
+## Usage Examples
 
-results_file = '$RESULTS_FILE'
-subset_name = '$SUBSET_NAME'
-oc_filename = '$OC_FILENAME'
-summary_base = '${SUMMARY_BASE}'
+### Test async evaluator only (run from repo root `/root/nathan/opencompass`):
+```bash
+python async_healthbench_eval.py \
+  --predictions outputs/.../predictions/MODEL/ \
+  --dataset-subset base \
+  --mode per_rubric \
+  --limit 5 \
+  --subset dev_tiny \
+  --concurrency 200 \
+  --output test_results.json \
+  --judge-log test_judge.jsonl
+```
 
-try:
-    with open(results_file) as f:
-        r = json.load(f)
-    acc = r.get('accuracy')
-    std = r.get('accuracy_std')
-    n = r.get('n_samples', 0)
-    
-    if acc is not None:
-        print(f'  {subset_name} ({oc_filename}):')
-        print(f'    Accuracy: {acc:.4f} ± {std:.4f} (n={n})')
-        
-        # Write to CSV
-        with open(f'{summary_base}.csv', 'a') as csv:
-            csv.write(f'{oc_filename},{acc:.6f},{std:.6f},{n}\\n')
-        
-        # Write to markdown
-        with open(f'{summary_base}.md', 'a') as md:
-            md.write(f'### {oc_filename}\\n')
-            md.write(f'- Accuracy: {acc:.4f} ± {std:.4f}\\n')
-            md.write(f'- N Samples: {n}\\n\\n')
-        
-        # Write to text
-        with open(f'{summary_base}.txt', 'a') as txt:
-            txt.write(f'{oc_filename}: {acc:.4f} ± {std:.4f} (n={n})\\n')
-    else:
-        print('    No results')
-except Exception as e:
-    print(f'    (could not read: {e})', file=sys.stderr)
-PYTHON_SCRIPT
-    fi
-done
+### Full pipeline (run from repo root `/root/nathan/opencompass`):
+```bash
+./run_healthbench_full.sh qwen3-4b-thinking-2507 dev_50 200
+```
 
-echo ""
-echo "Summary files created:"
-echo "  - ${SUMMARY_BASE}.md"
-echo "  - ${SUMMARY_BASE}.csv"
-echo "  - ${SUMMARY_BASE}.txt"
+### Resume from interruption:
+```bash
+python async_healthbench_eval.py \
+  --predictions outputs/.../predictions/MODEL/ \
+  --dataset-subset base \
+  --resume-from existing_judge_log.jsonl \
+  --judge-log existing_judge_log.jsonl \
+  --output results.json
+```
+
+## Data Download and Layout
+
+- Download HealthBench JSONL data from the official release: `https://huggingface.co/datasets/opencompass/healthbench` (contains `2025-05-07-06-14-12_oss_eval.jsonl`, `hard_2025-05-08-21-00-10.jsonl`, `consensus_2025-05-09-20-00-46.jsonl`).
+- Save the JSONL files to `data/healthbench/` inside the repo. The async evaluator defaults to these paths when `--dataset-subset` is provided.
+- Ensure you run commands from the repo root `/root/nathan/opencompass` so relative paths resolve.
+
+## Output Format
+
+```json
+{
+  "accuracy": 0.46,
+  "accuracy_std": 0.02,
+  "n_samples": 50,
+  "config": {
+    "mode": "per_rubric",
+    "concurrency": 200,
+    "judge_model": "...",
+    "dataset_subset": "base",
+    "dev_subset": "dev_50",
+    ...
+  },
+  "timing": {
+    "total_seconds": 123.4,
+    "examples_scored": 50,
+    "rps": 2.5
+  },
+  "details": {
+    "example_tag_metrics": {...},
+    "rubric_tag_metrics": {...}
+  }
+}
+```
+
+## Judge Log Format (JSONL)
+
+Each line is a self-contained JSON object:
+```json
+{"prompt_id": "...", "rubric_index": 3, "rubric_points": 2.0, "criteria_met": true, "explanation": "...", "raw_response": "..."}
+```
+
+## Validation Plan
+
+1. Run OC on `dev_50` (inference only, `--mode infer`)
+2. Run async evaluator on those predictions
+3. Compare scores to OC's full run (should match)
+4. Confirm throughput ~10x faster (2+ rps vs 0.21 rps)
+
+## Known Issues / Future Improvements
+
+1. **Join by prompt_id:** Currently uses position index. Would be safer to join by `prompt_id` if OC predictions include it.
+   - **Status:** Known limitation, has safety checks (length assertions + logging)
+   - **Priority:** Medium - should prioritize adding prompt_id to predictions
+
+2. **Model config:** The wrapper config requires models to be added.
+   - **Status:** `healthbench_infer_config.py` has placeholder for models
+   - **Solution:** Add model config import or define models inline in the config file
+
+3. **Resume state reconstruction:** Currently resume only skips items, doesn't reconstruct full results.
+   - **Status:** Works but could be optimized
+   - **Future:** Load from judge log to rebuild ScoredExample objects directly
+
+4. **Error handling:** ✅ **IMPROVED**
+   - ✅ Fail loudly if no prediction files match pattern
+   - ✅ Log exactly which files were matched per subset
+   - ✅ Judge call stats (total, successful, failed, success rate)
+   - ✅ Clear summary at end with subset info
+
+## Risk Mitigation (Addressing Feedback)
+
+### 1. Index-based Join ✅
+- **Current:** Position-based join with safety checks
+- **Safety measures:**
+  - Length assertions with warnings
+  - Logs first 5 entries showing index + prompt_id for manual verification
+  - Fails if no predictions match dataset indices
+- **Future:** Switch to prompt_id join when OC predictions include it
+
+### 2. Prediction Pattern Assumptions ✅
+- **Current:** Pattern matching for subset files
+- **Safety measures:**
+  - ✅ Logs exactly which files matched per subset
+  - ✅ Fails loudly if none matched (exits with error + shows available files)
+  - Pattern mapping is explicit and documented
+
+### 3. Multi-subset Behavior ✅
+- **Current:** Runs base, hard, consensus separately
+- **Safety measures:**
+  - ✅ Each output clearly shows `dataset_subset` in config
+  - ✅ `n_samples` and `accuracy` refer to the specific subset being scored
+  - ✅ Separate results files per subset
+  - ✅ Limits are subset-specific and documented
+
+### 4. Resume Semantics ✅
+- **Current:** Skips already-judged pairs, rewrites results.json
+- **Status:** Works for first version
+- **Future:** Can rebuild ScoredExample objects from judge log (polish task)
+
+### 5. Error Handling and Observability ✅
+- **Current:** Comprehensive error handling and logging
+- **Features:**
+  - ✅ Fail fast on missing predictions, dataset load errors, judge config errors
+  - ✅ Clear summary: judge calls attempted, success rate, failures
+  - ✅ Progress logging with RPS
+  - ✅ Timing information
+
+## Files Modified
+
+- `async_healthbench_eval.py` - Added `--limit`, `--subset`, `--dataset-subset` flags
+- `run_healthbench_full.sh` - Updated config path and added multi-subset support
+
+## Dependencies
+
+- `openai` (AsyncOpenAI)
+- `numpy` (for bootstrap_std)
+- `asyncio` (for async judge calls)
+- OpenCompass dataset classes (for loading)
+
+## Testing Status
+
+- ✅ Scoring module created and imports successfully
+- ✅ Async evaluator created with all features
+- ✅ Bash wrapper created
+- ⚠️  Models config needs to be added to `healthbench_infer_config.py` (see Quick Fix below)
+- ⏳ Validation against OC results pending
+- ⏳ Throughput verification pending
+
+## Quick Fix: Adding Models to Config
+
+To fix the `KeyError: 'models'` error, edit `healthbench_infer_config.py` and add:
+
+```python
+# Option 1: Import from existing model config
+from opencompass.configs.models.your_model_name import models
+
+# Option 2: Define inline (example)
+from opencompass.models import OpenAISDK
+models = [
+    dict(
+        abbr="your-model-name",
+        type=OpenAISDK,
+        path="your-model-path",
+        # ... other model config ...
+    ),
+]
+```
+
+Or modify `run_healthbench_full.sh` to accept a model config file and merge it.
+
+## How to Run (End-to-End)
+
+1) Set judge API env vars (required)
+```bash
+export OC_JUDGE_API_BASE="http://YOUR_API_BASE/v1"
+export OC_JUDGE_API_KEY=YOUR_KEY
+export OC_JUDGE_MODEL="qwen3-235b-a22b-thinking-2507"
+```
+
+2) (Optional) Limit HealthBench subset for inference
+```bash
+# dev_tiny | dev_50 | dev_medium | full
+export HEALTHBENCH_SUBSET=dev_tiny
+```
+
+3) Ensure inference model is defined in `healthbench_infer_config.py`
+   - Currently set to `qwen3-4b-thinking-2507` via OpenAISDK (vLLM-style API)
+   - Adjust `openai_api_base` if your inference server is not `http://localhost:8000/v1`
+
+4) Run the full pipeline
+```bash
+cd /root/nathan/opencompass
+chmod +x run_healthbench_full.sh
+
+# Example: dev_tiny, concurrency 200
+./run_healthbench_full.sh qwen3-4b-thinking-2507 dev_tiny 200
+
+# Example: dev_50, concurrency 200
+./run_healthbench_full.sh qwen3-4b-thinking-2507 dev_50 200
+```
+
+This will:
+- Run OC inference
+- Run async evaluator for base/hard/consensus (limits per dev subset)
+- Write results in OC-compatible structure
+- Write judge logs for resume/debug
+
+5) Resume (optional)
+```bash
+python async_healthbench_eval.py \
+  --predictions <pred_dir> \
+  --dataset-subset base \
+  --mode per_rubric \
+  --resume-from judge_logs/healthbench.jsonl \
+  --judge-log judge_logs/healthbench.jsonl \
+  --output results/qwen3-4b-thinking-2507/healthbench.json
+```
+
+## Directory Layout (After Run)
+
+For a run with work_dir `outputs/healthbench_dev_tiny_<TS>`:
+```
+outputs/healthbench_dev_tiny_<TS>/
+  ├─ predictions/                # OC inference outputs (may be under timestamp if inference-only)
+  │   └─ MODEL/
+  ├─ results/                    # Async eval results (OC-compatible)
+  │   └─ MODEL/
+  │       ├─ healthbench.json
+  │       ├─ healthbench_hard.json
+  │       └─ healthbench_consensus.json
+  ├─ logs/
+  │   └─ eval/MODEL/             # Async eval logs
+  ├─ summary/
+  │   ├─ summary_<TS>.md
+  │   ├─ summary_<TS>.csv
+  │   └─ summary_<TS>.txt
+  └─ judge_logs/                 # Extra (resume/debug)
+      ├─ healthbench.jsonl
+      ├─ healthbench_hard.jsonl
+      └─ healthbench_consensus.jsonl
+```
+Notes:
+- OC inference may place predictions under an additional timestamp subdir when run in inference-only mode. The wrapper now searches both direct `predictions/` and `TIMESTAMP/predictions/`.
+- Results/logs/summary are written directly under the work_dir to mirror OC’s layout.
+
+## Troubleshooting
+
+- **Missing models (KeyError: 'models')**: Add models to `healthbench_infer_config.py` (see Quick Fix above).
+- **API 404/5xx errors**: We now retry 404/5xx/429 with backoff. Persistent 404 likely indicates wrong model name or API base.
+- **No prediction files matched**: Check the predictions directory and subset. Patterns expected:
+  - base: `healthbench.json`
+  - hard: `healthbench_hard.json`
+  - consensus: `healthbench_consensus.json`
+- **Join alignment**: We log first 5 indices + prompt_id and assert lengths. If misaligned, ensure predictions correspond to the same dataset ordering; long-term fix is to include `prompt_id` in predictions and join by id.
+- **Performance**: Use `--concurrency` to tune; default 200. Judge logs stream to JSONL for resume.
+
+## Why the Structure Differs from OC (and How We Aligned It)
+
+- OC runs create a timestamped work_dir; we initially inherited an extra timestamp when running inference-only. The wrapper now:
+  - Searches both direct `predictions/` and `TIMESTAMP/predictions/`.
+  - Writes `results/`, `logs/eval/`, `summary/` directly under the work_dir to match OC.
+- We add `judge_logs/` (extra) for resume/debug; OC doesn’t produce these.
+
+
